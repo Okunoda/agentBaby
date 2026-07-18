@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSeek Chat</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- 左侧会话列表 -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <span class="logo">💬 会话</span>
+        <button id="new-session-btn" title="新建会话">＋</button>
+      </div>
+      <ul id="session-list"></ul>
+    </aside>
+
+    <!-- 右侧对话区 -->
+    <main id="chat-panel">
+      <header id="chat-header">
+        <span id="chat-title">选择或新建一个会话</span>
+      </header>
+
+      <div id="messages"></div>
+
+      <div id="input-bar">
+        <textarea id="input" placeholder="输入你的问题，Enter 发送 / Shift+Enter 换行" rows="1"></textarea>
+        <button id="send-btn">发送</button>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
