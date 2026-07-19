@@ -13,13 +13,21 @@ import json
 #   2) 直接运行脚本:  python backend/main.py / PyCharm 运行  (绝对导入)
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from backend.db import Message, Session, SessionLocal, init_db
+    from backend.db import (
+        Message, Session, SessionMemory, AutoMemory, MemoryConflict, SessionLocal, init_db,
+    )
     from backend.llm import chat_completion, chat_completion_stream
+    from backend.config import settings
+    from backend.memory import orchestrator, milvus_store, session_memory, auto_dream
 else:
-    from .db import Message, Session, SessionLocal, init_db
+    from .db import (
+        Message, Session, SessionMemory, AutoMemory, MemoryConflict, SessionLocal, init_db,
+    )
     from .llm import chat_completion, chat_completion_stream
+    from .config import settings
+    from .memory import orchestrator, milvus_store, session_memory, auto_dream
 
-app = FastAPI(title="DeepSeek Chat")
+app = FastAPI(title="高考志愿·高报师 (记忆增强)")
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -27,6 +35,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    auto_dream.start_worker()  # 启动 Auto Dream 后台巡检
 
 
 # ---------- Schemas ----------
@@ -196,29 +205,23 @@ def chat_stream(session_id: str, body: ChatIn):
             db.refresh(user_msg)
             db.refresh(s)
 
-            # 组装历史 (含本次用户消息)
-            msgs = (
-                db.query(Message)
-                .filter(Message.session_id == session_id)
-                .order_by(Message.id)
-                .all()
-            )
-            history = [{"role": m.role, "content": m.content} for m in msgs]
+            # === 记忆编排：组装带三层记忆的上下文 (last_active 仍为上一轮) ===
+            messages, debug = orchestrator.build_messages(db, s)
+            orchestrator.touch_session(db, s)  # 组装后再更新活跃时间
 
-            # 通知前端：用户消息已入库、会话标题
-            yield _sse(
-                {
-                    "type": "start",
-                    "user_message_id": user_msg.id,
-                    "session_title": s.title,
-                }
-            )
+            # 通知前端：用户消息已入库、会话标题、本轮记忆调试信息
+            yield _sse({
+                "type": "start",
+                "user_message_id": user_msg.id,
+                "session_title": s.title,
+                "memory": debug,
+            })
 
             # 流式调用大模型
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
             try:
-                for kind, delta in chat_completion_stream(history):
+                for kind, delta in chat_completion_stream(messages):
                     if kind == "reasoning":
                         reasoning_parts.append(delta)
                     else:
@@ -229,19 +232,23 @@ def chat_stream(session_id: str, body: ChatIn):
                 return
 
             # 落库助手消息
+            assistant_text = "".join(content_parts)
             assistant_msg = Message(
                 session_id=session_id,
                 role="assistant",
-                content="".join(content_parts),
+                content=assistant_text,
                 reasoning="".join(reasoning_parts) or None,
             )
             db.add(assistant_msg)
             db.commit()
             db.refresh(assistant_msg)
 
-            yield _sse(
-                {"type": "done", "assistant_message_id": assistant_msg.id}
+            # === 每轮结束：异步触发 Auto Memory 提取 + Session Memory 更新 ===
+            orchestrator.schedule_after_turn(
+                session_id, s.user_id, content, assistant_text
             )
+
+            yield _sse({"type": "done", "assistant_message_id": assistant_msg.id})
         finally:
             db.close()
 
@@ -253,6 +260,92 @@ def chat_stream(session_id: str, body: ChatIn):
             "X-Accel-Buffering": "no",  # 关闭 nginx 缓冲
         },
     )
+
+
+# ---------- 记忆管理 API ----------
+@app.get("/api/memory/long-term")
+def api_long_term(user_id: str = settings.DEFAULT_USER_ID):
+    rows = milvus_store.list_memories(user_id)
+    import time
+    now = int(time.time())
+    out = []
+    for r in rows:
+        last = r.get("last_access_time", now)
+        out.append({
+            "id": str(r.get("id")),
+            "content": r.get("content"),
+            "gen_path": r.get("gen_path"),
+            "evidence": r.get("evidence"),
+            "mem_type": r.get("mem_type"),
+            "weight": r.get("weight"),
+            "access_count": r.get("access_count"),
+            "age_days": round((now - last) / 86400, 1),
+        })
+    return {"user_id": user_id, "count": len(out), "memories": out}
+
+
+@app.get("/api/memory/auto")
+def api_auto_memory(user_id: str = settings.DEFAULT_USER_ID):
+    with SessionLocal() as db:
+        rows = (
+            db.query(AutoMemory)
+            .filter(AutoMemory.user_id == user_id)
+            .order_by(AutoMemory.id.desc())
+            .limit(100)
+            .all()
+        )
+        return [{
+            "id": r.id, "brief": r.brief, "mem_type": r.mem_type,
+            "related_context": r.related_context, "evidence": r.evidence,
+            "source": r.source, "status": r.status, "emotion": r.emotion,
+        } for r in rows]
+
+
+@app.get("/api/memory/conflicts")
+def api_conflicts(user_id: str = settings.DEFAULT_USER_ID):
+    with SessionLocal() as db:
+        rows = (
+            db.query(MemoryConflict)
+            .filter(MemoryConflict.user_id == user_id, MemoryConflict.status == "open")
+            .order_by(MemoryConflict.id.desc())
+            .all()
+        )
+        return [{
+            "id": r.id, "description": r.description,
+            "memory_existing": r.memory_existing, "memory_new": r.memory_new,
+        } for r in rows]
+
+
+@app.post("/api/memory/conflicts/{cid}/resolve")
+def api_resolve_conflict(cid: int):
+    with SessionLocal() as db:
+        c = db.get(MemoryConflict, cid)
+        if not c:
+            raise HTTPException(404, "冲突不存在")
+        c.status = "resolved"
+        db.commit()
+        return {"ok": True}
+
+
+@app.post("/api/memory/dream")
+def api_dream(user_id: str = settings.DEFAULT_USER_ID):
+    """手动触发一次 Auto Dream 整合(便于演示)。"""
+    return auto_dream.run_dream(user_id, force=True)
+
+
+@app.get("/api/sessions/{session_id}/session-memory")
+def api_session_memory(session_id: str):
+    with SessionLocal() as db:
+        sm = db.get(SessionMemory, session_id)
+        d = session_memory.to_dict(sm)
+        return {
+            "session_id": session_id,
+            "sections": [
+                {"key": k, "label": label, "value": d.get(k, "")}
+                for k, label in SessionMemory.SECTIONS
+            ],
+            "updated_at": sm.updated_at.isoformat() if sm else None,
+        }
 
 
 # ---------- 前端静态资源 ----------

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DeepSeek Chat</title>
+  <title>志愿领航 · 高报师</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -11,25 +11,50 @@
     <!-- 左侧会话列表 -->
     <aside id="sidebar">
       <div class="sidebar-header">
-        <span class="logo">💬 会话</span>
+        <span class="logo">🎓 志愿领航</span>
         <button id="new-session-btn" title="新建会话">＋</button>
       </div>
       <ul id="session-list"></ul>
+      <div class="sidebar-footer">高报师 · 三层记忆增强</div>
     </aside>
 
-    <!-- 右侧对话区 -->
+    <!-- 中间对话区 -->
     <main id="chat-panel">
       <header id="chat-header">
         <span id="chat-title">选择或新建一个会话</span>
+        <button id="toggle-memory" title="记忆面板">🧠 记忆</button>
       </header>
 
       <div id="messages"></div>
 
       <div id="input-bar">
-        <textarea id="input" placeholder="输入你的问题，Enter 发送 / Shift+Enter 换行" rows="1"></textarea>
+        <textarea id="input" placeholder="向高报师提问，如：我是四川考生，物化生，620分，想学计算机…（Enter 发送 / Shift+Enter 换行）" rows="1"></textarea>
         <button id="send-btn">发送</button>
       </div>
     </main>
+
+    <!-- 右侧记忆面板 -->
+    <aside id="memory-panel">
+      <div class="mem-header">
+        <span>🧠 记忆面板</span>
+        <button id="refresh-memory" title="刷新">⟳</button>
+      </div>
+      <div class="mem-tabs">
+        <button class="mem-tab active" data-tab="working">本轮注入</button>
+        <button class="mem-tab" data-tab="session">会话记忆</button>
+        <button class="mem-tab" data-tab="longterm">长期记忆</button>
+        <button class="mem-tab" data-tab="pipeline">记忆管道</button>
+      </div>
+      <div class="mem-body">
+        <div class="mem-view active" id="view-working"></div>
+        <div class="mem-view" id="view-session"></div>
+        <div class="mem-view" id="view-longterm"></div>
+        <div class="mem-view" id="view-pipeline"></div>
+      </div>
+      <div class="mem-footer">
+        <button id="dream-btn">💤 触发 Auto Dream 整合</button>
+      </div>
+    </aside>
   </div>
 
   <script src="/static/app.js"></script>
