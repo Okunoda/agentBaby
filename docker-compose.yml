@@ -1,0 +1,203 @@
+# =============================================================================
+# agentBaby 容器合集 —— mysql + milvus(etcd/minio/standalone)
+# -----------------------------------------------------------------------------
+# 文件位置：/Users/Zhuanz/myProject/agentBaby/docker-compose.yml
+# Project：agentbaby（小写，Docker Desktop 按 com.docker.compose.project 分组）
+#
+# 常用命令：
+#   创建（不启动）：docker compose -p agentbaby -f docker-compose.yml create
+#   启动（手动）：   docker compose -p agentbaby -f docker-compose.yml start
+#   停止：           docker compose -p agentbaby -f docker-compose.yml stop
+#   删除容器（卷保留）：docker compose -p agentbaby -f docker-compose.yml down
+#
+# 设计目标：
+#   - 容器手动启动，绝不自启（所有服务 restart: no）
+#   - 容器名用 plain 名（mysql/etcd/minio/standalone），不用 agentBaby- 前缀
+#   - 通过 com.docker.compose.project=agentbaby label 在 Docker Desktop 聚合
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 坑 #1：Docker Desktop 必须用 docker compose 创建，不能用裸 docker create
+# -----------------------------------------------------------------------------
+# Docker Desktop "Compose" UI 和 `docker compose start/stop` 识别一个项目要 5 个
+# label 同时存在：
+#   - com.docker.compose.project              ← 项目名（必须小写，见坑 #2）
+#   - com.docker.compose.service              ← service 名
+#   - com.docker.compose.project.config_files ← compose 文件绝对路径
+#   - com.docker.compose.project.working_dir  ← compose 工作目录
+#   - com.docker.compose.config-hash          ← 文件内容指纹
+#
+# 裸 `docker create --label com.docker.compose.project=X` 只能贴前两个，
+# 后三个是 docker compose 自己写进去的。少了它们 → 报
+#   "no container found for project 'X': not found"
+#
+# 所以：要让 Docker Desktop / compose CLI 管理容器，必须用本文件 + `compose create`。
+# -----------------------------------------------------------------------------
+# 坑 #2：Project 名必须小写
+# -----------------------------------------------------------------------------
+# docker compose 默认按目录名做 project 名，且强制小写。`-p X` 显式指定时
+# X 也要小写，否则 label 与 compose 查找用的 key 大小写不一致：
+#   "no container found for project 'agentbaby': not found"
+# 全用小写。
+# -----------------------------------------------------------------------------
+# 坑 #3：容器名用 plain 名（不带项目前缀），只靠 label 聚合
+# -----------------------------------------------------------------------------
+# 业务上 mysql 就是 mysql，不要叫 agentBaby-mysql。Docker Desktop 里的"项目分组"
+# 来自 label，不是名字。容器名跟 service 名一致即可。
+# -----------------------------------------------------------------------------
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MySQL：会话/消息/暂存/冲突表
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: "no"
+    networks:
+      agentBaby-net:
+        aliases: [mysql]
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: chat_app
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+  # ---------------------------------------------------------------------------
+  # etcd：Milvus 元数据存储
+  # ---------------------------------------------------------------------------
+  # 坑 #4（最容易踩）：advertise-client-urls 必须用 docker 网络别名
+  # ---------------------------------------------------------------------------
+  # etcd 启动后会把 -advertise-client-urls 这个地址告诉所有连上来的客户端，
+  # 客户端再用这个地址继续通信。
+  #
+  # 如果写 http://127.0.0.1:2379 → milvus 收到这个地址后会在自己的容器里
+  # 连 127.0.0.1:2379，但 127.0.0.1 是 milvus 本身，永远连不到 etcd →
+  # "init with etcd failed: context deadline exceeded" → streaming 初始化
+  # panic。
+  #
+  # 正确写法：用 docker 网络别名 http://etcd:2379，DNS 会把 etcd 解析到
+  # etcd 容器在 agentBaby-net 上的 IP（172.24.0.x）。
+  # ---------------------------------------------------------------------------
+  # 同时坑 #5：milvus 容器必须真挂在 agentBaby-net 上，DNS 才能解析 etcd 别名。
+  # 如果 milvus 的 NetworkSettings.Networks 是空对象 {}，会报
+  #   "lookup etcd on 192.168.65.7:53: network is unreachable"
+  # （192.168.65.7 是 Docker Desktop 给容器配的宿主 DNS）。
+  # 用本文件 `docker compose create` 创建会确保网络挂上；裸 docker create
+  # 后手动删容器重建时容易丢网络。
+  # ---------------------------------------------------------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    container_name: etcd
+    restart: "no"
+    networks:
+      agentBaby-net:
+        aliases: [etcd]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - etcd-data:/etcd
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379   # 必须是 etcd:2379，不是 127.0.0.1:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+
+  # ---------------------------------------------------------------------------
+  # MinIO：Milvus 对象存储（存向量/索引分块）
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: minio
+    restart: "no"
+    networks:
+      agentBaby-net:
+        aliases: [minio]
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    command: ["minio", "server", "/minio_data"]
+
+  # ---------------------------------------------------------------------------
+  # Milvus standalone：对外提供 gRPC 19530 + metrics 9091
+  # ---------------------------------------------------------------------------
+  # 坑 #6：metrics 端口 9091 已被 langfuse-minio-1 占用
+  # ---------------------------------------------------------------------------
+  # 宿主机上 langfuse 的 minio 把 127.0.0.1:9091 占了（9001 控制台），
+  # milvus 直接映射 9091:9091 会报 "Bind for 127.0.0.1:9091 failed: port is
+  # already allocated"。把外部端口改成 19091，容器内仍是 9091。
+  # 主端口 19530 没有冲突，保持原样。
+  # ---------------------------------------------------------------------------
+  standalone:
+    image: milvusdb/milvus:v2.6.20
+    container_name: standalone
+    restart: "no"
+    networks:
+      agentBaby-net:
+        aliases: [milvus]
+    ports:
+      - "19530:19530"
+      - "19091:9091"    # 9091 → 19091（避让 langfuse-minio-1）
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    command: ["milvus", "run", "standalone"]
+    depends_on:
+      - etcd
+      - minio
+
+
+# -----------------------------------------------------------------------------
+# 坑 #7：network 用 external: true 复用已有的 agentBaby-net
+# -----------------------------------------------------------------------------
+# 如果不写 external，compose 会自己创建一个叫 agentbaby_default 的网络，
+# 这会导致：
+#   - 容器间仍能互通（DNS 解析按 service 名）
+#   - 但 docker network ls 里多一个冗余网络
+#   - docker compose down 时这个网络会被一起删，下一次启动要重建
+# 写 external: true 复用手动建的 agentBaby-net，单一来源。
+# -----------------------------------------------------------------------------
+networks:
+  agentBaby-net:
+    external: true
+    name: agentBaby-net
+
+
+# -----------------------------------------------------------------------------
+# 坑 #8：volume 用 external: true 复用已有的命名卷
+# -----------------------------------------------------------------------------
+# 命名卷（agentBaby-mysql-data 等）先用 `docker volume create` 手动建好（也
+# 可以让 compose 第一次创建后保留下来），compose 文件里写 external: true 来
+# 复用。否则每次 compose down/up 都会：
+#   - 报 "volume ... already exists but was not created by Docker Compose"
+#   - 重新创建新卷导致数据丢失（极端情况）
+# 命名规范：项目前缀 + 服务用途，方便 docker volume ls 里辨识。
+# -----------------------------------------------------------------------------
+volumes:
+  mysql-data:
+    name: agentBaby-mysql-data
+    external: true
+  etcd-data:
+    name: agentBaby-milvus-etcd-data
+    external: true
+  minio-data:
+    name: agentBaby-milvus-minio-data
+    external: true
+  milvus-data:
+    name: agentBaby-milvus-data
+    external: true
