@@ -78,7 +78,7 @@ def generate_and_save(session_id: str, messages: list[dict]) -> dict | None:
         conversation = "\n".join(
             f"{m['role']}: {m['content']}" for m in messages if m.get("role") in ("user", "assistant")
         )
-        prompt = _PROMPT.format(existing=existing, conversation=conversation[:12000])
+        prompt = _PROMPT.format(existing=existing, conversation=conversation[:settings.SESSION_MEMORY_PROMPT_MAX_CHARS])
         data = complete_json(prompt)
         if not isinstance(data, dict):
             return None

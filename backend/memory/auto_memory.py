@@ -35,7 +35,7 @@ _PROMPT = """你是高考志愿咨询系统的记忆提取模块。阅读用户�
 
 def extract_and_store(user_id: str, session_id: str, conversation: str) -> dict:
     """同步执行的提取逻辑(由后台线程调用)。返回统计信息。"""
-    data = complete_json(_PROMPT.format(conversation=conversation[:8000]))
+    data = complete_json(_PROMPT.format(conversation=conversation[:settings.AUTO_MEMORY_PROMPT_MAX_CHARS]))
     if not isinstance(data, dict):
         return {"extracted": 0}
 

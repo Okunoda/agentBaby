@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     Integer,
+    BigInteger,
     DateTime,
     ForeignKey,
     text,
@@ -121,17 +122,27 @@ class AutoMemory(Base):
 
 
 class MemoryConflict(Base):
-    """Auto Dream 发现的冲突 / 需澄清待办 (不自动覆盖，必须用户确认)。"""
+    """Auto Dream 发现的冲突 / 需澄清待办 (必须由用户选出"主要记忆"，舍弃另一条)。"""
 
     __tablename__ = "memory_conflict"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
-    description: Mapped[str] = mapped_column(Text)      # 冲突描述 / 需澄清问题
+    description: Mapped[str] = mapped_column(Text)      # 冲突描述
+    # 两侧文本(冗余存档；milvus id 优先以 chosen 字段为准)
     memory_existing: Mapped[str] = mapped_column(Text, default="")
+    memory_existing_milvus_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
+    )
     memory_new: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(16), default="open", index=True)  # open/resolved
+    memory_new_milvus_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)  # open / chosen
+    # 用户最终选定的"主要" Milvus id；舍弃另一条
+    chosen_memory_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class DreamState(Base):

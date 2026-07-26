@@ -39,7 +39,10 @@ _PROMPT = """你是高考志愿系统的「记忆整合(Auto Dream)」模块。�
 
 只输出 JSON：
 {{"consolidated":[{{"content":"凝练后的记忆","type":"偏好|事实|约束","gen_path":"综合产生路径","evidence":"证据"}}],
-"conflicts":[{{"description":"冲突/需澄清描述","existing":"已有记忆","new":"新记忆"}}]}}"""
+"conflicts":[{{"description":"冲突/需澄清描述","existing":"已有记忆全文","new":"新记忆全文","existing_id":"已有记忆的id(从【已有长期记忆】列表中抄, 没有可填 null)","new_id":null}}]}}
+注意：
+- 冲突的 existing_id / new_id 尽可能填值，方便用户做"渐进式澄清"时定位到具体那一条。
+- 若 new 端是新记忆(尚未入库)，new_id 留 null。"""
 
 
 def should_dream(db, user_id: str) -> bool:
@@ -86,7 +89,8 @@ def run_dream(user_id: str, force: bool = False) -> dict:
         )
         existing_rows = milvus_store.list_memories(user_id, limit=100)
         existing = "\n".join(
-            f"- [{r.get('mem_type')}] {r.get('content')}" for r in existing_rows
+            f"- id={r.get('id')}[{r.get('mem_type')}] {r.get('content')}"
+            for r in existing_rows
         ) or "（暂无）"
 
         data = complete_json(_PROMPT.format(existing=existing, fragments=fragments))
@@ -109,17 +113,39 @@ def run_dream(user_id: str, force: bool = False) -> dict:
             )
             added += 1
 
-        # 冲突 → 需澄清待办(不覆盖)
+        # 冲突 → 需澄清待办：模型若给出 existing_id / new_id 则精确对齐到 Milvus 记录；
+        # 否则退化成按文本匹配最近一条候选
         from ..db import MemoryConflict
         conf_added = 0
+        new_id_to_text = {(r.get("content", "") or "").strip(): r.get("id") for r in existing_rows}
+        # 查找 pending 新碎片中的内容(模型标注的 "new") 以关联 milvus id
+        pending_content_to_id = {(r.brief or "").strip(): None for r in rows}
+
         for cf in conflicts:
             desc = (cf.get("description") or "").strip()
             if not desc:
                 continue
+            existing_text = (cf.get("existing") or "").strip()
+            new_text = (cf.get("new") or "").strip()
+
+            existing_mid = (
+                cf.get("existing_id")
+                or new_id_to_text.get(existing_text)
+                or _search_one(user_id, existing_text)
+            )
+            new_mid = cf.get("new_id") or _search_one(user_id, new_text) if new_text else None
+
+            # 防止两侧 id 重复填了空 / 同号
+            if existing_mid == new_mid:
+                new_mid = None
+
             db.add(MemoryConflict(
                 user_id=user_id, description=desc,
-                memory_existing=(cf.get("existing") or "").strip(),
-                memory_new=(cf.get("new") or "").strip(), status="open",
+                memory_existing=existing_text,
+                memory_existing_milvus_id=existing_mid,
+                memory_new=new_text,
+                memory_new_milvus_id=new_mid,
+                status="open",
             ))
             conf_added += 1
 
@@ -136,6 +162,16 @@ def run_dream(user_id: str, force: bool = False) -> dict:
 
         return {"ran": True, "processed": len(rows), "consolidated": added,
                 "conflicts": conf_added}
+
+
+def _search_one(user_id: str, text: str):
+    """在长期记忆中找一条最相似的 milvus id，用于冲突定位。"""
+    if not text:
+        return None
+    hits = milvus_store.search_memories(user_id, text, top_k=1, threshold=0.5)
+    if hits:
+        return int(hits[0]["id"])
+    return None
 
 
 # ---------- 后台巡检(模拟消息队列 + 分布式并发控制) ----------

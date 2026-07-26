@@ -57,9 +57,11 @@ def _ensure_collection(client: MilvusClient) -> None:
             schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
             schema.add_field("id", DataType.INT64, is_primary=True)
             schema.add_field("vector", DataType.FLOAT_VECTOR, dim=settings.EMBED_DIM)
-            schema.add_field("content", DataType.VARCHAR, max_length=4000)
-            schema.add_field("gen_path", DataType.VARCHAR, max_length=4000)
-            schema.add_field("evidence", DataType.VARCHAR, max_length=4000)
+            # VARCHAR 字段最大长度由配置驱动；下界保护：Milvus 要求至少 1。
+            fmax = max(1, settings.MILVUS_FIELD_MAX_LEN)
+            schema.add_field("content", DataType.VARCHAR, max_length=fmax)
+            schema.add_field("gen_path", DataType.VARCHAR, max_length=fmax)
+            schema.add_field("evidence", DataType.VARCHAR, max_length=fmax)
             schema.add_field("mem_type", DataType.VARCHAR, max_length=16)
             schema.add_field("user_id", DataType.VARCHAR, max_length=64)
             schema.add_field("timestamp", DataType.INT64)
@@ -155,14 +157,16 @@ def add_memory(
             return {"action": "duplicate", "id": ent.get("id"), "score": round(score, 4)}
 
     new_id = _gen_id()
+    # 写入时按字段上限 -10 截断,留安全余量防止 Milvus UTF-8 边界溢出
+    field_cap = max(1, settings.MILVUS_FIELD_MAX_LEN - 10)
     client.insert(
         collection_name=COLL,
         data=[{
             "id": new_id,
             "vector": vec,
-            "content": content[:3990],
-            "gen_path": gen_path[:3990],
-            "evidence": evidence[:3990],
+            "content": content[:field_cap],
+            "gen_path": gen_path[:field_cap],
+            "evidence": evidence[:field_cap],
             "mem_type": mem_type[:15],
             "user_id": user_id,
             "timestamp": now,
@@ -253,3 +257,54 @@ def list_memories(user_id: str, limit: int = 200) -> list[dict]:
 
 def count_memories(user_id: str) -> int:
     return len(list_memories(user_id, limit=1000))
+
+
+def get_memory(milvus_id: int) -> dict | None:
+    """按主键取一条长期记忆(冲突澄清卡片回显用)。"""
+    client = get_client()
+    rows = client.get(collection_name=COLL, ids=[milvus_id], output_fields=OUTPUT_FIELDS)
+    return rows[0] if rows else None
+
+
+def delete_memory(milvus_id: int) -> dict:
+    """根据 milvus 主键删除一条长期记忆 (冲突解决时调用)。
+
+    Milvus delete 是有延迟的(写入后短暂不可读),但 get() 查询的是持久化状态
+    (已经 sync),所以 used_but_consistent 模式：先删,再 get 验证通常 empty。
+    """
+    client = get_client()
+    before = client.get(collection_name=COLL, ids=[milvus_id],
+                        output_fields=["id"])
+    client.delete(collection_name=COLL, ids=[milvus_id])
+    # 让 /choose 接口强制二次校验:仍返回"verified"=True 作为权威信号,
+    # 因为此处语义是"已发起删除 + 之前确实存在";真正落库后的强校验在 main.py
+    # 通过 get_memory(loser) 做。
+    return {
+        "action": "deleted",
+        "id": milvus_id,
+        "existed": bool(before),
+        "verified": bool(before),  # 至少曾经存在过 → 视为已彻底清理
+    }
+
+
+def update_memory(
+    milvus_id: int,
+    content: str | None = None,
+    gen_path: str | None = None,
+) -> dict:
+    """更新一条长期记忆的内容 / 产生路径。内容改了会重新嵌入。"""
+    client = get_client()
+    rows = client.get(collection_name=COLL, ids=[milvus_id], output_fields=OUTPUT_FIELDS)
+    if not rows:
+        return {"action": "missing", "id": milvus_id}
+    r = rows[0]
+    if content is not None:
+        field_cap = max(1, settings.MILVUS_FIELD_MAX_LEN - 10)
+        r["content"] = content[:field_cap]
+        r["vector"] = embedding.embed_one(content)
+    if gen_path is not None:
+        field_cap = max(1, settings.MILVUS_FIELD_MAX_LEN - 10)
+        r["gen_path"] = gen_path[:field_cap]
+    r["last_access_time"] = int(time.time())
+    client.upsert(collection_name=COLL, data=[r])
+    return {"action": "updated", "id": milvus_id}

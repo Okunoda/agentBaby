@@ -69,6 +69,12 @@ def build_messages(db, session: Session) -> tuple[list[dict], dict]:
         "gap_min": round(gap_min, 1), "turns_before": turns_before,
         "inject_snapshot": inject_snapshot, "reconnect": reconnect,
         "tokens": tokens, "compressed": False, "working_memory_hits": len(wm),
+        "working_memory_payload": [
+            {"id": m.get("id"), "content": m.get("content"),
+             "gen_path": m.get("gen_path"), "mem_type": m.get("mem_type"),
+             "score": m.get("score")}
+            for m in wm
+        ],
     }
 
     if (reconnect or over_limit) and turns_before > settings.RECENT_TURNS_KEEP:

@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
+from datetime import datetime
 
 # 兼容两种运行方式：
 #   1) 作为模块运行:  python -m uvicorn backend.main:app   (相对导入)
@@ -18,14 +19,14 @@ if __package__ in (None, ""):
     )
     from backend.llm import chat_completion, chat_completion_stream
     from backend.config import settings
-    from backend.memory import orchestrator, milvus_store, session_memory, auto_dream
+    from backend.memory import orchestrator, milvus_store, session_memory, auto_dream, working_memory
 else:
     from .db import (
         Message, Session, SessionMemory, AutoMemory, MemoryConflict, SessionLocal, init_db,
     )
     from .llm import chat_completion, chat_completion_stream
     from .config import settings
-    from .memory import orchestrator, milvus_store, session_memory, auto_dream
+    from .memory import orchestrator, milvus_store, session_memory, auto_dream, working_memory
 
 app = FastAPI(title="高考志愿·高报师 (记忆增强)")
 
@@ -34,8 +35,16 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 @app.on_event("startup")
 def _startup() -> None:
+    # 1) 配置校验：模块导入时已经过一次；此处再做"启动前最终体检"，
+    #    目的是把多条缺失信息汇总一次性报给运维，避免被第一个异常打断。
+    from .config import require_settings
+    require_settings()
+
+    # 2) 数据库初始化
     init_db()
-    auto_dream.start_worker()  # 启动 Auto Dream 后台巡检
+
+    # 3) 启动 Auto Dream 后台巡检
+    auto_dream.start_worker()
 
 
 # ---------- Schemas ----------
@@ -73,6 +82,14 @@ class ChatOut(BaseModel):
     user_message: MessageOut
     assistant_message: MessageOut
     session_title: str
+
+
+class ConflictChooseIn(BaseModel):
+    choice: str  # "existing" | "new"
+
+    # 补充信息(可选，仅当记忆需要微调时使用)
+    updated_content: str | None = None
+    updated_gen_path: str | None = None
 
 
 # ---------- Session CRUD ----------
@@ -217,6 +234,21 @@ def chat_stream(session_id: str, body: ChatIn):
                 "memory": debug,
             })
 
+            # === 渐进式澄清：工作记忆命中的 Milvus id 若存在 open 冲突 → 先发卡片 ===
+            wm_payload = (debug or {}).get("working_memory_payload") or []
+            wm_ids = [int(m["id"]) for m in wm_payload if m.get("id") is not None]
+            open_confs = (
+                working_memory.open_conflicts_for(s.user_id, wm_ids) if wm_ids else []
+            )
+            if open_confs:
+                yield _sse({"type": "clarifications", "items": open_confs})
+                yield _sse({
+                    "type": "done",
+                    "assistant_message_id": None,
+                    "awaiting_clarification": True,
+                })
+                return  # 暂停 LLM，等用户点选
+
             # 流式调用大模型
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -311,20 +343,90 @@ def api_conflicts(user_id: str = settings.DEFAULT_USER_ID):
             .all()
         )
         return [{
-            "id": r.id, "description": r.description,
-            "memory_existing": r.memory_existing, "memory_new": r.memory_new,
+            "id": r.id,
+            "description": r.description,
+            "memory_existing": r.memory_existing,
+            "memory_existing_id": r.memory_existing_milvus_id,
+            "memory_new": r.memory_new,
+            "memory_new_id": r.memory_new_milvus_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
         } for r in rows]
 
 
-@app.post("/api/memory/conflicts/{cid}/resolve")
-def api_resolve_conflict(cid: int):
+@app.post("/api/memory/conflicts/{cid}/choose")
+def api_choose_conflict(cid: int, body: ConflictChooseIn):
+    """用户"渐进式澄清"：在 existing / new 之间选一个作为主要，另一条从 Milvus 真正删除。
+
+    body.choice:
+      "existing"  → 保留 memory_existing_milvus_id 一条，删除 memory_new(若有 Milvus id)
+      "new"       → 保留 memory_new_milvus_id 一条，删除 memory_existing
+    """
+    if body.choice not in ("existing", "new"):
+        raise HTTPException(400, "choice 必须为 'existing' 或 'new'")
+
     with SessionLocal() as db:
         c = db.get(MemoryConflict, cid)
         if not c:
             raise HTTPException(404, "冲突不存在")
-        c.status = "resolved"
+        if c.status != "open":
+            return {"ok": True, "already_chosen": True}
+
+        # 按用户选择决定保留/舍弃的记忆 milvus id
+        if body.choice == "existing":
+            keep_id = c.memory_existing_milvus_id
+            drop_id = c.memory_new_milvus_id
+        else:
+            keep_id = c.memory_new_milvus_id
+            drop_id = c.memory_existing_milvus_id
+
+        # 真正删除"舍弃的那一条"长期记忆 (sync delete + 二次校验)
+        delete_result = None
+        if drop_id is not None:
+            try:
+                delete_result = milvus_store.delete_memory(int(drop_id))
+            except Exception as e:
+                print(f"[conflict] delete memory {drop_id} failed: {e}")
+        else:
+            # 新端尚未入库(在 Auto Dream 的待合并列表里) → 不需删 Milvus
+            delete_result = {"action": "skipped", "reason": "not_in_milvus",
+                             "verified": True}
+
+        # (可选) 用户对保留的记忆做最终修正确认
+        if body.updated_content and keep_id is not None:
+            try:
+                milvus_store.update_memory(
+                    int(keep_id),
+                    content=body.updated_content,
+                    gen_path=body.updated_gen_path or "",
+                )
+            except Exception as e:
+                print(f"[conflict] update memory {keep_id} failed: {e}")
+
+        # 用户回答完之后,我们再核一次:winner 必须仍在,loser 已没有(若此前在 Milvus)
+        kept_now = None
+        if keep_id is not None:
+            kept_now = milvus_store.get_memory(int(keep_id))
+        loser_now = None
+        if drop_id is not None:
+            loser_now = milvus_store.get_memory(int(drop_id))
+
+        c.chosen_memory_id = keep_id
+        c.status = "chosen"
+        c.resolved_at = datetime.utcnow()
         db.commit()
-        return {"ok": True}
+
+        return {
+            "ok": True,
+            "kept": body.choice,
+            "kept_id": keep_id,
+            "deleted_id": drop_id,
+            # 详细结果,前端会显示出来以便核对
+            "delete_result": delete_result,
+            "post_state": {
+                "kept_in_milvus": bool(kept_now),
+                "loser_in_milvus": bool(loser_now),
+            },
+        }
 
 
 @app.post("/api/memory/dream")
