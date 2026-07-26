@@ -8,32 +8,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 常用命令
 
-### 环境
+### 环境（uv 管理依赖）
 ```bash
-python -m venv .venv
-source .venv/Scripts/activate                # Windows Git Bash
-pip install -r requirements.txt
+# 首次：自动装 .venv + 按 uv.lock 装依赖
+uv sync
+
+# 后续运行任何命令都建议加 uv run，会自动激活 venv
+uv run python -m uvicorn backend.main:app --host 0.0.0.0 --port 8010
+
+# 加新依赖
+uv add <pkg>
+
+# 升某个依赖
+uv add <pkg>==<ver>
+
+# 升所有依赖到 lock 允许的最新版
+uv lock --upgrade
+
+# 删 venv 重建
+uv sync --reinstall
 ```
 
 ### 启动依赖（外部服务）
 ```bash
-# Milvus（etcd + minio + standalone）—— 长期记忆向量库
-docker compose -f milvus-docker-compose.yml up -d
+# 容器合集：mysql + milvus(etcd/minio/standalone)
+# 见 docker-compose.yml 顶部注释了解踩过的坑
+docker compose -p agentbaby -f docker-compose.yml create   # 创建（不启动）
+docker compose -p agentbaby -f docker-compose.yml start    # 手动启动
 
-# MySQL —— 会话/消息/暂存/冲突。root/root, 3306, db `chat_app` 首次启动自动建
+# 不用 uv 的话也可以直接用 docker，端口/卷/etc. 同 compose 文件
 ```
 
 ### 启动应用
 ```bash
-# 任选其一（端口 8010，因为 Attu 占 8000）
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8010
-# 或 PyCharm 直接运行 backend/main.py
+# 推荐用 uv run（端口 8010，因为 Attu 占 8000）
+uv run python -m uvicorn backend.main:app --host 0.0.0.0 --port 8010
+# 或 PyCharm 直接运行 backend/main.py（IDE 自己配 venv 指向 .venv）
 ```
 浏览器打开 http://localhost:8010。
 
 ### Embedding 检索 demo
 ```bash
-python backend/demo_embedding_search.py
+uv run python backend/demo_embedding_search.py
 ```
 插入 4 句中文偏好（"我喜欢编程/我不喜欢计算机/我不喜欢编程/我不喜欢数学"）到临时 collection `demo_embedding_test`，展示 IP=cosine 检索效果，**运行结束会自动 drop，不污染业务 collection**。首次启动会自动下载百炼 embedding 模型。
 

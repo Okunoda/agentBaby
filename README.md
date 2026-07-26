@@ -50,18 +50,21 @@ frontend/            index.html / style.css / app.js
 - **MySQL**（docker: root/root, 3306）→ 库 `chat_app` 自动创建
 - **Milvus v2.6.20**（docker compose: etcd + minio + milvus）
   ```bash
-  docker compose -f milvus-docker-compose.yml up -d
+  # 见 docker-compose.yml（mysql + milvus 全套），合集名 agentbaby
+  docker compose -p agentbaby -f docker-compose.yml create   # 创建（不启动）
+  docker compose -p agentbaby -f docker-compose.yml start    # 手动启动
   ```
   集合 `long_term_memory` 首次启动自动创建（1024-dim, IP metric）。
 
 ## 运行
+依赖用 [uv](https://docs.astral.sh/uv/) 管理（取代 pip + venv）：
 ```bash
-python -m venv .venv
-source .venv/Scripts/activate            # Windows Git Bash
-pip install -r requirements.txt
+# 首次：装 .venv + 按 uv.lock 装依赖
+uv sync
 
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8010
-# 或 PyCharm 直接运行 backend/main.py
+# 启动服务
+uv run python -m uvicorn backend.main:app --host 0.0.0.0 --port 8010
+# 或 PyCharm 直接运行 backend/main.py（IDE 配 venv 指向 .venv）
 ```
 浏览器打开 **http://localhost:8010**（注意：8000 被 Attu 占用，本应用用 8010）。
 
